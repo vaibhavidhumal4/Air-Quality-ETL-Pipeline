@@ -1,170 +1,108 @@
-# Importing the required libraries
-import creds
-from google.cloud import bigquery                 # To interact with BQ data warehouse
-import logging                                    # Logs errors and events
-import pandas as pd                               
-import asyncio                                    # Manages asynchronous python execution
-# Using httpx + asyncio, we fetch paginated API data concurrently with asyncio.gather(), making extraction much faster than sequential requests.
-import httpx                                      # Async HTTP client for APIs
-import pytz                                       # For time conversion and handling
-from datetime import datetime                     # Date and time manipulation
+# 1. IMPORTS 
+import asyncio, logging, httpx, pandas as pd, pytz
+from datetime import datetime, timedelta
+from google.colab import auth            # Colab login for BigQuery access
+from google.cloud import bigquery as bq
 
-# Importing creds file again to reload in Google colab
-import importlib
-import creds
-importlib.reload(creds)
+auth.authenticate_user()                 # opens a Google sign-in prompt; no key file needed
 
-# Setup logging to track the pipeline progress
+# 2. CONFIG
+class creds:                             # BigQuery target: project.dataset.table
+    PROJECT_ID, DATASET_ID, TABLE_ID = "project-66f56fc9-9de6-4cfd-8cf", "air_quality", "aqi_yesterday_today"
+
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+URL = "https://air-quality-api.open-meteo.com/v1/air-quality"   # free API, no key needed
+IST = pytz.timezone("Asia/Kolkata")      # all dates/times are handled in Indian time
 
-# Function to get IST timestamp
-def get_ist_time():
-    """Returns the current IST time as a naive object for BigQuery display."""
-    ist_tz = pytz.timezone('Asia/Kolkata')
-    # We get the time in IST, then remove the timezone info so BQ treats the 'hours' as literal/wall-clock time.
-    return datetime.now(ist_tz).replace(tzinfo=None)
+# Fields requested from the API (these become the table's pollutant columns)
+V = ["pm2_5", "pm10", "nitrogen_dioxide", "sulphur_dioxide", "carbon_monoxide", "ozone", "us_aqi"]
 
-# 1. DATA EXTRACTION: Function to extract data using API using asynchronous approach
-async def fetch_page(client, api_key, resource_id, offset):
-    """Fetch a single page of data."""
-    url = f"https://api.data.gov.in/resource/{resource_id}"
-    params = {"api-key": api_key, "format": "json", "offset": offset}
-    try:
-        response = await client.get(url, params=params, timeout=30.0)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        logging.error(f"Error at offset {offset}: {e}")
-        return None
+# State -> (latitude, longitude). Fixed lookup table of ONE representative point per state/UT.
+# The API needs a location to return data for. Pollution values are NOT stored here;
+# they are fetched live from the API on every run.
+ST = {"Andhra Pradesh": (16.51, 80.52), "Arunachal Pradesh": (27.08, 93.61), "Assam": (26.14, 91.79),
+    "Bihar": (25.59, 85.14), "Chhattisgarh": (21.25, 81.63), "Goa": (15.50, 73.83), "Gujarat": (23.22, 72.65),
+    "Haryana": (28.46, 77.03), "Himachal Pradesh": (31.10, 77.17), "Jharkhand": (23.34, 85.31),
+    "Karnataka": (12.97, 77.59), "Kerala": (8.52, 76.94), "Madhya Pradesh": (23.26, 77.41),
+    "Maharashtra": (19.08, 72.88), "Manipur": (24.82, 93.94), "Meghalaya": (25.57, 91.88),
+    "Mizoram": (23.73, 92.72), "Nagaland": (25.67, 94.11), "Odisha": (20.30, 85.82), "Punjab": (30.90, 75.86),
+    "Rajasthan": (26.91, 75.79), "Sikkim": (27.33, 88.61), "Tamil Nadu": (13.08, 80.27),
+    "Telangana": (17.39, 78.49), "Tripura": (23.83, 91.29), "Uttar Pradesh": (26.85, 80.95),
+    "Uttarakhand": (30.32, 78.03), "West Bengal": (22.57, 88.36), "Delhi": (28.61, 77.21),
+    "Jammu and Kashmir": (34.08, 74.80), "Ladakh": (34.16, 77.58), "Puducherry": (11.93, 79.83),
+    "Chandigarh": (30.73, 76.78), "Andaman and Nicobar Islands": (11.62, 92.73),
+    "Lakshadweep": (10.57, 72.64), "Dadra and Nagar Haveli and Daman and Diu": (20.40, 72.83)}
 
-async def extract_all_data_async(api_key, resource_id):
-    """Extracts EVERY record by calculating total pages first."""
-    all_records = []
-    limit = 10
-    
-    async with httpx.AsyncClient() as client:
-        # Step 1: Get the first page to see the 'total' records available
-        first_resp = await fetch_page(client, api_key, resource_id, offset=0, limit=limit)
-        if not first_resp: return []
-        
-        total_records = int(first_resp.get('total', 0))
-        all_records.extend(first_resp.get('records', []))
-        logging.info(f"Total records to fetch: {total_records}")
+# 3. EXTRACT (async API calls)
+async def get(c, sem, st, lat, lon, d0, d1):
+    """Fetch hourly data for ONE state. Retries up to 5 times on errors."""
+    async with sem:                      # semaphore: limits how many requests run at once
+        for i in range(5):
+            try:
+                r = await c.get(URL, params={"latitude": lat, "longitude": lon, "hourly": ",".join(V),
+                    "start_date": d0, "end_date": d1, "timezone": "Asia/Kolkata"}, timeout=60)
+                r.raise_for_status()     # raises an error on 4xx/5xx (e.g. 503) so we retry
+                return st, r.json()      # return state name with its data
+            except Exception as e:
+                logging.warning(f"{st} try {i+1}: {e}")
+                await asyncio.sleep(2 ** i)   # exponential backoff: wait 1s, 2s, 4s, 8s, 16s
+    return st, {}                        # all retries failed: return empty so the run continues
 
-        # Step 2: Create tasks for the remaining records
-        tasks = []
-        for offset in range(limit, total_records, limit):
-            tasks.append(fetch_page(client, api_key, resource_id, offset, limit))
-        
-        # Step 3: Run all requests concurrently
-        responses = await asyncio.gather(*tasks)
-        for r in responses:
-            if r: all_records.extend(r.get('records', []))
-            
-    logging.info(f"Successfully extracted {len(all_records)} records.")
-    return all_records
+async def extract():
+    """Call the API for all states in parallel (max 3 at a time)."""
+    now = datetime.now(IST)
+    d0, d1 = (now - timedelta(days=1)).date().isoformat(), now.date().isoformat()  # yesterday -> today
+    sem = asyncio.Semaphore(3)           # max 3 concurrent requests, to be polite to the free API
+    async with httpx.AsyncClient() as c:
+        # asyncio.gather runs all state requests concurrently and waits for all to finish
+        res = await asyncio.gather(*[get(c, sem, s, la, lo, d0, d1) for s, (la, lo) in ST.items()])
+    logging.info(f"{sum(1 for _, j in res if j.get('hourly'))}/{len(ST)} states fetched ({d0} to {d1})")
+    return res
 
+# 4. TRANSFORM (pandas)
+def transform(res):
+    # Build one DataFrame per state from the API's hourly arrays, tag it with the state, stack them
+    df = pd.concat([pd.DataFrame(j["hourly"]).assign(state=s) for s, j in res if j.get("hourly")])
+    df["ts"] = pd.to_datetime(df.pop("time"))           # 'time' string -> datetime column named 'ts'
+    now = datetime.now(IST).replace(tzinfo=None)
+    # The API also returns forecast hours for the rest of today, so drop future hours.
+    # Also drop rows where every pollutant value is empty.
+    df = df[df.ts <= now].dropna(subset=V, how="all")
+    # RENAME: API field names -> short column names
+    df = df.rename(columns={"pm2_5": "pm25", "nitrogen_dioxide": "no2", "sulphur_dioxide": "so2",
+        "carbon_monoxide": "co", "ozone": "o3"})
+    # NEW COLUMN 1: AQI category, bucketed from the US AQI value
+    df["aqi_category"] = pd.cut(df.us_aqi, [-1, 50, 100, 150, 200, 300, 500],
+        labels=["Good", "Moderate", "Unhealthy for Sensitive", "Unhealthy", "Very Unhealthy", "Hazardous"]).astype(str)
+    # NEW COLUMN 2: when this row was loaded
+    df["ingested_at_ist"] = now
+    return df.reset_index(drop=True)
 
-# 2. DATA TRANSFORMATION: Function to make the necessary transformations to the data
-def transform_data(raw_records):
-  """Transform: Clean the columns"""
-  if not raw_records:
-    return pd.DataFrame()
+# 5. BIGQUERY TABLE SCHEMA 
+SC = [bq.SchemaField(n, t) for n, t in [("state", "STRING"), ("ts", "DATETIME"), ("pm25", "FLOAT"),
+    ("pm10", "FLOAT"), ("no2", "FLOAT"), ("so2", "FLOAT"), ("co", "FLOAT"), ("o3", "FLOAT"),
+    ("us_aqi", "FLOAT"), ("aqi_category", "STRING"), ("ingested_at_ist", "DATETIME")]]
 
-  df = pd.DataFrame(raw_records)
+# 6. LOAD (staging -> main -> drop staging)
+def load(df):
+    c = bq.Client(project=creds.PROJECT_ID)
+    c.create_dataset(f"{creds.PROJECT_ID}.{creds.DATASET_ID}", exists_ok=True)   # create dataset if missing
+    m = f"{creds.PROJECT_ID}.{creds.DATASET_ID}.{creds.TABLE_ID}"; s = m + "_staging"
+    c.create_table(bq.Table(m, schema=SC), exists_ok=True)       # create main table if missing
+    # Step 1: load this run's rows into the staging table (WRITE_TRUNCATE = overwrite it each run)
+    cfg = bq.LoadJobConfig(schema=SC, write_disposition="WRITE_TRUNCATE")
+    c.load_table_from_dataframe(df[[f.name for f in SC]], s, job_config=cfg).result()
+    # Step 2: insert into main only the rows not already there.
+    # (state, ts) identifies a row, so re-running never creates duplicates.
+    c.query(f"""INSERT INTO `{m}` SELECT s.* FROM `{s}` s WHERE NOT EXISTS (
+        SELECT 1 FROM `{m}` t WHERE t.state=s.state AND t.ts=s.ts)""").result()
+    # Step 3: delete the staging table
+    c.delete_table(s, not_found_ok=True)
+    logging.info("Main updated, staging deleted.")
 
-  # Mapping
-  rename_map = {
-      'state': 'state',
-        'city_name': 'city',
-        '_2022___aqi___200___good_days': 'good_days_2022',
-        '_2022___aqi__200___bad_days': 'bad_days_2022',
-        '_2023___aqi___200___good_days': 'good_days_2023',
-        '_2023___aqi__200___bad_days': 'bad_days_2023',
-        '_2024___aqi___200___good_days': 'good_days_2024',
-        '_2024___aqi__200___bad_days': 'bad_days_2024'
-  }
-  df.rename(columns=rename_map, inplace = True)
+# 7. RUN 
+async def main():
+    res = await extract()                          # E: fetch from API
+    if any(j for _, j in res): load(transform(res))   # T + L, only if at least one state returned data
 
-  # Remove the serial no. column
-  if '_sl__no_' in df.columns:
-       df.drop(columns=['_sl__no_'], inplace=True)
-
-  # Convert numeric columns to float/int
-  numeric_cols= [c for c in df.columns if 'days' in c]
-  df[numeric_cols]= df[numeric_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
-
-  # Engineering new metrics
-  df['total_recorded_days'] = df['good_days_2024'] + df['bad_days_2024']
-  df['pollution_ratio_2024'] = (df['bad_days_2024'] / df['total_recorded_days']).fillna(0)
-
-  # Adding IST timestamp
-  df['timestamp_IST'] = get_ist_time()
-
-  logging.info("Transformation complete.")
-  return df
-
-
-# 3. DATA LOADING: Load the transformed data to BigQuery table
-
-def load_to_bigquery_with_staging(df, project, dataset, table_name, credentials_path):
-    client = bigquery.Client.from_service_account_json(credentials_path, project=project)
-    main_table_id = f"{project}.{dataset}.{table_name}"
-    staging_table_id = f"{main_table_id}_staging"
-
-    # Check if main table exists
-    try:
-        client.get_table(main_table_id)
-        logging.info(f"Main table '{main_table_id}' already exists.")
-    except Exception:
-        logging.info(f"Main table '{main_table_id}' does not exist. Creating it...")
-        client.load_table_from_dataframe(df, main_table_id).result()
-        logging.info("Main table created successfully.")
-
-    # Load to Staging (fresh load every time)
-    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
-    client.load_table_from_dataframe(df, staging_table_id, job_config=job_config).result()
-    logging.info(f"Staging table '{staging_table_id}' populated.")
-
-    # Insert new records into Main 
-    merge_query = f"""
-    INSERT INTO `{main_table_id}`
-    SELECT s.* FROM `{staging_table_id}` AS s
-    WHERE NOT EXISTS (
-        SELECT 1 FROM `{main_table_id}` AS m
-        WHERE m.state = s.state AND m.city = s.city
-    )
-    """
-
-    try:
-        client.query(merge_query).result()
-        logging.info("Main table updated successfully.")
-    except Exception as e:
-        logging.error(f"Insert failed. Ensure schema matches. Error: {e}")
-
-    # Cleanup staging table
-    client.delete_table(staging_table_id, not_found_ok=True)
-    logging.info("Staging table deleted.")
-      
-
-# 4. MAIN FUNCTION 
-if __name__ == "__main__":
-  async def main():
-    # Replace these with your actual path.
-    PATH_TO_JSON = "******" 
-    
-    raw_data = await extract_all_data_async(creds.API_KEY, creds.RESOURCE_ID)
-    print("Data extraction done")
-    if raw_data:
-        cleaned_df = transform_data(raw_data) 
-        print("Data transformation done")
-        load_to_bigquery_with_staging(
-            cleaned_df, 
-            creds.PROJECT_ID, 
-            creds.DATASET_ID, 
-            creds.TABLE_ID, 
-            PATH_TO_JSON
-        )
-        print("Data loading done")
-
-await main()
+await main()    # Colab supports top-level await; in a .py script use asyncio.run(main())
