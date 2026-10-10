@@ -1,0 +1,6 @@
+httpx
+pandas
+pytz
+google-cloud-bigquery
+pyarrow
+db-dtypes
